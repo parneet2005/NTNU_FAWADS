@@ -1,0 +1,279 @@
+function statsCSMA = simulateCSMACA(N, simTime, positions, params)
+%SIMULATECSMACA  Run slotted CSMA/CA with a single receiver over mobility trace
+%   Each node except params.recvId transmits to the receiver.
+%   Outputs statsCSMA(p).sendRate and statsCSMA(p).delayAve for each parTime.
+
+    % ACK duration in slots (could also use params.ackSlots)
+    phy       = params.phy;
+    ackSlots = 2;
+    recvId   = params.recvId;
+    dataSlots = 1;          % e.g., payload duration in slots
+    statsCSMA = struct();
+
+    for parTime = params.parTimeList
+        % Initialize per‐parTime state
+        packetBirthTime = initBirthTimes(N, parTime, recvId);
+        packetSendTime  = packetBirthTime;
+        collisionCount  = zeros(N,1);
+        dataSendCount   = zeros(N,1);
+        delayAccum      = zeros(N,1);
+        successCount    = 0;
+
+        % Channel state
+        channelBusy    = false(params.numChannel,1);
+        channelRelease = zeros(params.numChannel,1);
+
+        % Main time‐slot loop
+        for t = 1:simTime
+            % Release finished ACKs
+            done = channelRelease <= t;
+            channelBusy(done) = false;
+
+            % Determine in‐range transmitters
+            inRange = computeInRange(positions, recvId, params.rangeThreshold, t);
+            inRange(recvId) = false;  % ensure receiver is never a transmitter
+
+            % Transmission attempts
+            for i = 1:N
+                if i == recvId || ~inRange(i) || packetSendTime(i) > t
+                    continue;
+                end
+
+                                %% —— INSERT PATH‑LOSS CHECK HERE ——
+                % 1) distance
+                pos_tx = squeeze(positions(t, i, :));
+                pos_rx = squeeze(positions(t, recvId, :));
+                d      = norm(pos_tx - pos_rx);
+
+                % 2) path‑loss dB
+                PLdB   = computePathLossLogDistance(d, phy);
+
+                % 3) received power dBm
+                Pr_dBm = phy.Pt_dBm - PLdB;
+
+                % 4) if too weak, treat as failure & schedule backoff
+                if Pr_dBm < phy.RxSens_dBm
+                    collisionCount(i) = min(collisionCount(i)+1, 10);
+                    CWmin = 8; CWmax = 512;
+                    cw = min(CWmin * 2^collisionCount(i), CWmax);
+                    packetSendTime(i) = t + randi(cw);
+                    continue;
+                end
+
+                % Sense a random channel
+                ch = randi(params.numChannel);
+                if ~channelBusy(ch)
+                    % --- Success ---
+                    txFinish           = t + dataSlots + ackSlots;   % DATA + ACK
+                    successCount = successCount + 1;
+                    dataSendCount(i) = dataSendCount(i) + 1;
+                    delayAccum(i) = delayAccum(i) + (txFinish - packetBirthTime(i));
+                    % Occupy channel for ACK
+                    channelBusy(ch)    = true;
+                    channelRelease(ch) = txFinish;
+                    % Schedule next birth
+                    packetBirthTime(i) = txFinish + randi(parTime);
+                    packetSendTime(i)  = packetBirthTime(i);
+                    collisionCount(i)  = 0;
+                else
+                    % --- Collision/Backoff ---
+                    collisionCount(i) = min(collisionCount(i)+1, 5);
+                    backoff = randi(2^collisionCount(i)) + 1;
+                    packetSendTime(i) = t + backoff;
+                end
+                % Try to find an IDLE channel (CSMA), otherwise back off
+                perm = randperm(params.numChannel);
+                ch = 0;
+                for k = perm
+                    if ~channelBusy(k)
+                        ch = k; break;
+                    end
+                end
+                if ch == 0
+                    collisionCount(i) = min(collisionCount(i)+1, 10);
+                    CWmin = 8; CWmax = 512;
+                    cw = min(CWmin * 2^collisionCount(i), CWmax);
+                    packetSendTime(i) = t + randi(cw);
+                    continue;
+                end
+            end
+        end
+
+        % Compute & store metrics
+        metrics = computeMetrics(successCount, dataSendCount, delayAccum, simTime, 1);
+        statsCSMA(parTime).sendRate = metrics.sendRate;
+        statsCSMA(parTime).delayAve = metrics.delayAve;
+    end
+end
+
+% function statsCSMA = simulateCSMACA(N, simTime, positions, params)
+% %SIMULATECSMACA  Slotted CSMA/CA over mobility trace with log-distance path-loss
+% %   Single receiver (params.recvId), multi-channel. Time advances in slots of 4 samples.
+% %   Outputs statsCSMA(p).sendRate and statsCSMA(p).delayAve for each parTime.
+% 
+%     % ------ Timing & PHY ------
+%     slotLen   = 4;                % 1 MAC slot = 4 trace samples (align with ALOHA)
+%     dataSlots = 0;      %3           % DATA duration in MAC slots
+%     ackSlots  = 1;                 % ACK duration in MAC slots
+%     DIFS      = 0;       %0          % DIFS in MAC slots (minimal but nonzero)
+%     phy       = params.phy;
+%     recvId    = params.recvId;
+%     M         = params.numChannel;
+% 
+%     % ------ Backoff (802.11-like) ------
+%     CWmin     = 1;  %8               % in slots
+%     CWmax     = 32;  %512
+%     MAX_K     = 10;                % cap on exponent
+% 
+%     % helper: snap any time to the start of the next slot boundary (1-based time)
+%     snapNextSlot = @(t) t + mod(slotLen - mod(t-1, slotLen), slotLen);
+% 
+%     statsCSMA = struct();
+%     for parTime = params.parTimeList
+%         % -------- per-parTime node state --------
+%         packetBirthTime = initBirthTimes(N, parTime, recvId);
+%         packetBirthTime = arrayfun(snapNextSlot, packetBirthTime);
+% 
+%         % Head-of-line (HOL) packet bookkeeping
+%         firstBirthTime  = nan(N,1);          % when current HOL packet entered queue
+%         hasPacket       = true(N,1);         % nodes always have a packet process (renewal)
+%         hasPacket(recvId) = false;
+% 
+%         % CSMA/CA per-node state
+%         kExp        = zeros(N,1);            % backoff exponent (CW = CWmin*2^k, clamped)
+%         CW          = CWmin*ones(N,1);       % current contention window (in slots)
+%         boCounter   = -ones(N,1);            % backoff counter (in slots), -1 means idle/no packet ready
+%         difsCount   = zeros(N,1);            % consecutive idle slots observed on chosen channel
+%         chSel       = zeros(N,1);            % chosen channel (1..M), 0 if none yet
+% 
+%         % Channel state (per channel)
+%         channelBusy    = false(M,1);
+%         channelRelease = zeros(M,1);         % absolute time (trace samples) when channel becomes idle
+% 
+%         successCount  = 0;
+%         dataSendCount = zeros(N,1);
+%         delayAccum    = zeros(N,1);
+% 
+%         % -------- slot loop: t iterates in samples, but steps by slotLen --------
+%         for t = 1:slotLen:simTime
+%             % Release channels that finish at/ before t
+%             done = channelRelease <= t;
+%             channelBusy(done) = false;
+% 
+%             % Who is in range (geometry) this slot?
+%             inRange = computeInRange(positions, recvId, params.rangeThreshold, t);
+%             inRange(recvId) = false;
+% 
+%             % Make newly-born packets HOL and initialize CSMA state
+%             newlyReady = find(inRange & hasPacket & packetBirthTime <= t & boCounter < 0);
+%             for i = newlyReady(:)'
+%                 % pick a channel to track (listen/contend) until success or retry
+%                 chSel(i)    = randi(M);
+%                 kExp(i)     = 0;
+%                 CW(i)       = CWmin;
+%                 boCounter(i)= randi(CW(i)+1) - 1;   % uniform in [0..CW]
+%                 difsCount(i)= 0;
+%                 if isnan(firstBirthTime(i)), firstBirthTime(i) = packetBirthTime(i); end
+%             end
+% 
+%             % ---- CCA + backoff countdown (freeze on busy) ----
+%             % Nodes eligible to count down: have a HOL packet and are in range
+%             contenders = find(inRange & boCounter >= 0);
+%             % Track who intends to start this slot (after CCA + backoff)
+%             startersPerCh = cell(M,1);
+% 
+%             for i = contenders(:)'
+%                 ch = chSel(i);
+%                 if ch == 0, ch = randi(M); chSel(i) = ch; end
+% 
+%                 % Is channel idle this slot?
+%                 idle = ~channelBusy(ch);
+% 
+%                 if idle
+%                     % Count a DIFS idle slot
+%                     difsCount(i) = min(difsCount(i)+1, DIFS);
+%                     % Backoff only decrements when CCA is satisfied (idle) and after DIFS is met
+%                     if difsCount(i) >= DIFS && boCounter(i) > 0
+%                         boCounter(i) = boCounter(i) - 1;
+%                     end
+%                     % Ready to start?
+%                     if difsCount(i) >= DIFS && boCounter(i) == 0
+%                         startersPerCh{ch}(end+1) = i; %#ok<AGROW>
+%                     end
+%                 else
+%                     % Channel busy: freeze backoff and reset DIFS counter
+%                     difsCount(i) = 0;
+%                     % boCounter(i) unchanged (freeze)
+%                 end
+%             end
+% 
+%             % ---- Resolve transmissions channel-by-channel ----
+%             for ch = 1:M
+%                 starters = startersPerCh{ch};
+%                 if isempty(starters), continue; end
+% 
+%                 if numel(starters) == 1
+%                     i = starters(1);
+% 
+%                     % Path-loss / Rx sensitivity gate
+%                     pos_tx = squeeze(positions(t, i, :));
+%                     pos_rx = squeeze(positions(t, recvId, :));
+%                     d      = norm(pos_tx - pos_rx);
+%                     PLdB   = computePathLossLogDistance(d, phy);
+%                     Pr_dBm = phy.Pt_dBm - PLdB;
+% 
+%                     if Pr_dBm >= phy.RxSens_dBm
+%                         % ----- SUCCESS -----
+%                         txFinishSamples    = t + slotLen*(dataSlots + ackSlots);
+%                         successCount       = successCount + 1;
+%                         dataSendCount(i)   = dataSendCount(i) + 1;
+%                         delayAccum(i)      = delayAccum(i) + (txFinishSamples - firstBirthTime(i));
+% 
+%                         % Occupy channel (DATA+ACK)
+%                         channelBusy(ch)    = true;
+%                         channelRelease(ch) = txFinishSamples;
+% 
+%                         % Reset node CSMA state; schedule next packet arrival after completion
+%                         kExp(i)            = 0;
+%                         CW(i)              = CWmin;
+%                         boCounter(i)       = -1;                 % no HOL packet after success
+%                         difsCount(i)       = 0;
+%                         chSel(i)           = 0;
+%                         firstBirthTime(i)  = nan;
+%                         packetBirthTime(i) = txFinishSamples + slotLen * randi(parTime);
+% 
+%                     else
+%                         % ----- Failure due to weak signal (treat like collision) -----
+%                         kExp(i)  = min(kExp(i)+1, MAX_K);
+%                         CW(i)    = min(CWmin * 2^kExp(i), CWmax);
+%                         boCounter(i) = randi(CW(i)+1) - 1;       % [0..CW]
+%                         difsCount(i)  = 0;
+%                         % reselect a channel to avoid persistent bad link or crowding
+%                         chSel(i)      = randi(M);
+%                         % Keep firstBirthTime(i) (same HOL packet)
+%                     end
+% 
+%                 else
+%                     % ----- COLLISION: multiple starters on same channel this slot -----
+%                     for i = starters(:)'
+%                         kExp(i)  = min(kExp(i)+1, MAX_K);
+%                         CW(i)    = min(CWmin * 2^kExp(i), CWmax);
+%                         boCounter(i) = randi(CW(i)+1) - 1;       % [0..CW]
+%                         difsCount(i)  = 0;
+%                         % optional: randomize channel after collision
+%                         chSel(i)      = randi(M);
+%                         % Keep firstBirthTime(i)
+%                     end
+%                     % Channel becomes busy for the duration of the (failed) overlap?
+%                     % In basic CSMA/CA modeling we can mark it busy just for DATA duration
+%                     % but since both failed immediately, we leave the channel as-is (still idle next slot).
+%                 end
+%             end
+%         end
+% 
+%         % -------- metrics --------
+%         metrics = computeMetrics(successCount, dataSendCount, delayAccum, simTime, slotLen);
+%         statsCSMA(parTime).sendRate = metrics.sendRate;
+%         statsCSMA(parTime).delayAve = metrics.delayAve;
+%     end
+% end

@@ -1,0 +1,157 @@
+%% load your RoadRunner scenario output
+load("simulationData_100_1ms.mat","time","positions");
+[~, N, ~] = size(positions);
+fprintf('There are %d vehicles in this RoadRunner scenario.\n', N);
+
+timeVec = time(:);
+stepMultiplier = 1;
+if stepMultiplier > 1
+    dt = median(diff(timeVec));
+    originalTimeVec = timeVec;
+    originalPositions = positions;
+
+    positions = repmat(originalPositions, stepMultiplier, 1, 1);
+    timeVec = originalTimeVec(1) + (0:(numel(originalTimeVec)*stepMultiplier - 1)).' * dt;
+end
+simTime = numel(timeVec);
+fprintf('Simulation steps = %d\n', simTime);
+
+%% protocol parameters
+dataLength     = 1;
+parTimeList    = [3,5,7, 10];
+rangeThreshold = 1000;
+recvId         = 1;
+numChannel     = 16;
+rsuPos         = [12, -82, 0];
+standardProfile = 'NR-V2X-FR1-SL-30kHz';
+
+%% build params ONCE
+params = struct();
+params.parTimeList    = parTimeList;
+params.numChannel     = numChannel;
+params.rangeThreshold = rangeThreshold;
+params.recvId         = recvId;
+params.rsuPos         = rsuPos;
+
+% FAWADS knobs
+params.fa.CWmin       = 8;
+params.fa.CWmax       = 512;
+
+% density-awareness config
+params.density.mode     = 'fixed';
+params.density.window_s = 1.0;
+
+% CW adaptation knobs
+params.cw.CWmin_base    = 16;
+params.cw.CWmax_cap     = 1024;
+params.cw.alpha_linear  = 0.08;
+
+% PHY
+params.phy.d0         = 1;
+params.phy.f0         = 5.9e9;
+params.phy.c          = 3e8;
+params.phy.PL0        = 20*log10(4*pi*params.phy.d0*params.phy.f0/params.phy.c);
+params.phy.n          = 3;
+params.phy.sigma      = 6;
+params.phy.Pt_dBm     = 20;
+params.phy.RxSens_dBm = -85;
+params.phy.PtLP_dBm   = 20;
+params.phy.PtHP_dBm   = 30;
+
+%% V2X traffic model configuration
+params.traffic.enable = true;
+
+% Slot duration from RoadRunner time vector
+params.slotTime_s = median(diff(timeVec));
+
+% CAM: periodic safety awareness
+params.traffic.CAM.enable = true;
+params.traffic.CAM.period_s = 0.100;       % 100 ms
+params.traffic.CAM.sizeBytes = 300;
+params.traffic.CAM.deadline_s = 0.100;
+params.traffic.CAM.priority = 2;
+
+% DENM: event-triggered emergency traffic
+params.traffic.DENM.enable = true;
+params.traffic.DENM.meanInterArrival_s = 0.050;  % exponential mean 50 ms
+params.traffic.DENM.minSizeBytes = 200;
+params.traffic.DENM.maxSizeBytes = 2000;
+params.traffic.DENM.deadline_s = 0.050;
+params.traffic.DENM.priority = 3;
+
+% Background traffic: overload source
+params.traffic.BG.enable = true;
+params.traffic.BG.probPerSlot = 0.02;
+params.traffic.BG.minSizeBytes = 800;
+params.traffic.BG.maxSizeBytes = 1200;
+params.traffic.BG.deadline_s = 0.500;
+params.traffic.BG.priority = 1;
+
+% Traffic-aware FAWADS behavior
+params.trafficAware.enable = true;
+
+% Higher priority traffic gets stronger protection
+params.trafficAware.CAM.diversity = 2;
+params.trafficAware.DENM.diversity = 3;
+params.trafficAware.BG.diversity = 1;
+
+params.trafficAware.CAM.CWmin = 8;
+params.trafficAware.DENM.CWmin = 4;
+params.trafficAware.BG.CWmin = 16;
+%% optional 3GPP Release 16 / NR-V2X behavior profile
+% params = apply3GPPRel16Profile(params, standardProfile);
+
+% reproducibility
+params.seed = 12345;
+
+% optional: keep same W axis for all runs
+if N < 50
+    params.windowList = 1:N-1;
+elseif N < 100
+    params.windowList = 2:2:N-2;
+else
+    params.windowList = 5:5:N-5;
+end
+
+%% choose diversity orders to compare
+diversityList = [3];
+params.numDiversity = diversityList(1);
+
+%% run FAWADS diversity sweep
+resultsFA = runFAWADSDiversitySweep(N, dataLength, simTime, positions, params, diversityList);
+
+%% plot a few offered loads
+plotFAWADSDiversityVsW(resultsFA, [3 10]);
+
+%% or plot all parTimes
+% plotFAWADSDiversityVsW(resultsFA, parTimeList);
+
+%% call the FAWADS simulator
+statsFAWADS = simulateFAWADSIC(N, dataLength, simTime, positions, params );
+ statsCSMA = simulateCSMACA(N, simTime, positions, params);
+ statsALOHA = simulateSlottedALOHA(N, simTime, positions, params);
+ plotProtocolComparison(statsFAWADS, statsCSMA, statsALOHA, parTimeList)
+
+
+[sumKnee, detKnee] = analyzeCWSelection(statsFAWADS, parTimeList, ...
+    'ProtocolName','FAWADS-SIC', ...
+    'SmoothMethod','movmean', 'SmoothSpan',3, ...
+    'ThroughputFrac',0.95, 'LatencyTol',0.02, ...
+    'KneeMethod','line', ...
+    'Plot',true);
+
+
+% plotParetoFrontAll(detKnee, 'ProtocolName','FAWADS-SIC');
+% 
+% plotParetoFrontAll_clean(detKnee, 'ProtocolName','FAWADS-SIC', 'AnnotateEvery', 4);
+
+
+%% now hand off to the plotting routine
+% make sure plotFAWADSResults.m is on your path
+% plotFAWADSResults(statsFAWADS, parTimeList);
+% New figure matching the example panels for parTime = 3 and 10
+% plotWindowLatencyAndRate(statsFAWADS, [3 10]);
+% Plot CSMA & comparisons
+% plotCSMAResults(statsCSMA, parTimeList)
+
+% plotCSMAandCompare(stats, statsCSMA, parTimeList);

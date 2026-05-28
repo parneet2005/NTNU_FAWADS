@@ -1,0 +1,386 @@
+function statsTheory = simulateFAWADSICtheory(N, dataLength, simTime, positions, params)
+% simulateFAWADSICtheory
+% Theory-side approximation for FAWADS + diversity + SIC using:
+%   H(i): HP-waiting backlog state
+%   A_LP(i): effective LP attempt probability including LP retransmissions
+%
+% Outputs:
+%   statsFAWADS(p).windowList
+%   statsFAWADS(p).sendRate
+%   statsFAWADS(p).delayAve
+%   statsFAWADS(p).minDelay
+%   statsFAWADS(p).maxSend
+p = 1;      % first parTime in parTimeList
+idx = 1;    % first W in windowList
+
+statsTheory(p).theory(idx)
+   
+    if ~isfield(params,'fa') || ~isstruct(params.fa), params.fa = struct(); end
+    if ~isfield(params.fa,'CWmin') || isempty(params.fa.CWmin), params.fa.CWmin = 8; end
+    if ~isfield(params.fa,'CWmax') || isempty(params.fa.CWmax), params.fa.CWmax = 512; end
+
+    if ~isfield(params,'numChannel') || isempty(params.numChannel), params.numChannel = 16; end
+    if ~isfield(params,'numDiversity') || isempty(params.numDiversity), params.numDiversity = 3; end
+    if ~isfield(params,'captureThreshold') || isempty(params.captureThreshold), params.captureThreshold = 0; end
+    if ~isfield(params,'propDelay') || isempty(params.propDelay), params.propDelay = 0; end
+    if ~isfield(params,'maxRetryStage') || isempty(params.maxRetryStage), params.maxRetryStage = 5; end
+
+    % optional theory solver settings
+    if ~isfield(params,'theory') || ~isstruct(params.theory), params.theory = struct(); end
+    if ~isfield(params.theory,'Tol') || isempty(params.theory.Tol), params.theory.Tol = 1e-10; end
+    if ~isfield(params.theory,'MaxIter') || isempty(params.theory.MaxIter), params.theory.MaxIter = 300; end
+
+    M = params.numChannel;
+    D = min(params.numDiversity, M);
+    c = params.captureThreshold;
+    d = params.propDelay;
+    mMax = params.maxRetryStage;
+
+    statsFAWADS = struct();
+
+    % Same W sweep logic as simulation
+    if N < 50
+        windowSweep = 1:N-1;
+    elseif N < 100
+        windowSweep = 2:2:N-2;
+    else
+        windowSweep = 5:5:N-5;
+    end
+
+    for p = 1:numel(params.parTimeList)
+        parTime = params.parTimeList(p);
+        g = 2 / (parTime + 1);   % same as your simulator
+
+        sendRate = zeros(size(windowSweep));
+        delayAve = zeros(size(windowSweep));
+
+        minDelay = inf;
+        maxSend  = 0;
+
+        for idx = 1:numel(windowSweep)
+            W = windowSweep(idx);
+
+            % ---------- Fixed-point initialization ----------
+            Pt = min(g, 0.9);    % effective LP attempt probability
+            Ph = min(g, 0.9);    % HP attempt probability in slot N
+            H1 = 0.0;            % boundary condition H(1)
+            H  = zeros(N,1);     % HP backlog state
+            ALP = zeros(N,1);    % effective LP attempt probabilities
+            piw_i_prev = min(max(W/N,0),1) * ones(N,1);
+
+            maxIter = params.theory.MaxIter;
+            tol     = params.theory.Tol;
+
+            for it = 1:maxIter
+                % ----- 1) Channel-level probabilities from current Pt, Ph -----
+                pL = min(max(Pt * D / M, 0), 1);
+                pH = min(max(Ph * D / M, 0), 1);
+
+                % LP branch success (strict simplified SIC)
+                PsuccLP_branch = (1 - pL)^(N-1) * ...
+                    ( (1 - pH)^(N-1) + (N-1)*pH*(1 - pH)^(N-2) );
+
+                % LP packet success/failure (OR over D branches)
+                sL = 1 - (1 - PsuccLP_branch)^D;
+                fL = 1 - sL;
+
+                % HP capture success on one channel
+                qc = 0.0;
+                for k = 0:c
+                    qc = qc + nchoosek_safe(N-1, k) * pL^k * (1-pL)^(N-1-k);
+                end
+
+                % HP packet success/failure across D branches
+                sH = 1 - (1 - qc)^D;
+                fH = 1 - sH;
+
+                % ----- 2) Stage-dependent pi_w^(m)(i), then averaged pi_w(i) -----
+                piw_i = zeros(N,1);
+
+                if it == 1
+                    piw_prov = min(max(W / N, 0), 1);
+                else
+                    valid = 1:max(N-W-1,1);
+                    piw_prov = mean(piw_i_prev(valid));
+                end
+
+                % probability of failed LP staying LP
+                fStayLP = fL * (1 - piw_prov);
+                alpha = stageWeightsGeometric(fStayLP, mMax);
+
+                for i = 1:max(N-W-1,0)
+                    piw_stage = zeros(mMax,1);
+                    for m = 0:mMax-1
+                        CWm = min(params.fa.CWmax, params.fa.CWmin * 2^m);
+                        piw_stage(m+1) = piWindowStage(i, N, W, CWm);
+                    end
+                    piw_i(i) = sum(alpha .* piw_stage);
+                end
+                piw_i_prev = piw_i;
+
+                % ----- 3) Effective average LP backoff -----
+                Bbar = 0;
+                for m = 0:mMax-1
+                    CWm = min(params.fa.CWmax, params.fa.CWmin * 2^m);
+                    % simulator uses randi([1,CW]) => mean = (CW+1)/2
+                    Bbar = Bbar + alpha(m+1) * (CWm + 1)/2;
+                end
+
+                % ----- 4) Update H(i) and A_LP(i) -----
+                Hnew = zeros(N,1);
+                Anew = zeros(N,1);
+                Hnew(1) = H1;
+
+                % outside window
+                for i = 1:max(N-W-1,0)
+                    denom = 1 - fL * (1 - piw_i(i));
+                    denom = max(denom, 1e-12);
+
+                    Anew(i) = ((1 - Hnew(i)) * g) / denom;
+                    Anew(i) = min(max(Anew(i),0),1);
+
+                    Hnew(i+1) = Hnew(i) + Anew(i) * fL * piw_i(i);
+                    Hnew(i+1) = min(max(Hnew(i+1),0),1);
+                end
+
+                % inside window: new arrivals join HP backlog directly
+                for i = max(N-W,1):N-1
+                    Hnew(i+1) = Hnew(i) + (1 - Hnew(i)) * g;
+                    Hnew(i+1) = min(max(Hnew(i+1),0),1);
+                end
+
+                % ----- 5) Update Pt and Ph -----
+                % HP attempt in slot N
+                Ph_new = Hnew(N) + (1 - Hnew(N)) * g;
+                Ph_new = min(max(Ph_new,0),1);
+
+                % LP effective attempt probability
+                if N-W-1 >= 1
+                    Pt_new = sum(Anew(1:N-W-1)) / (N - W);
+                else
+                    Pt_new = 0;
+                end
+                Pt_new = min(max(Pt_new,0),1);
+
+                % boundary from HP failure
+                H1_new = Ph_new * fH;
+                H1_new = min(max(H1_new,0),1);
+
+                % ----- 6) Check convergence -----
+                err = max([abs(Pt_new-Pt), abs(Ph_new-Ph), abs(H1_new-H1), max(abs(Hnew-H))]);
+
+                Pt  = Pt_new;
+                Ph  = Ph_new;
+                H1  = H1_new;
+                H   = Hnew;
+                ALP = Anew;
+
+                if err < tol
+                    break;
+                end
+            end
+
+            % ---------- Final performance metrics ----------
+            % Recompute with converged values
+            pL = min(max(Pt * D / M, 0), 1);
+            pH = min(max(Ph * D / M, 0), 1);
+
+            PsuccLP_branch = (1 - pL)^(N-1) * ...
+                ( (1 - pH)^(N-1) + (N-1)*pH*(1 - pH)^(N-2) );
+
+            sL = 1 - (1 - PsuccLP_branch)^D;
+            fL = 1 - sL;
+
+            qc = 0.0;
+            for k = 0:c
+                qc = qc + nchoosek_safe(N-1, k) * pL^k * (1-pL)^(N-1-k);
+            end
+            sH = 1 - (1 - qc)^D;
+            fH = 1 - sH;
+
+            % Recompute piw_i and Bbar with converged values
+            piw_i = zeros(N,1);
+            piw_prov = min(max(W / N, 0), 1);
+            fStayLP = fL * (1 - piw_prov);
+            alpha = stageWeightsGeometric(fStayLP, mMax);
+
+            for i = 1:max(N-W-1,0)
+                tmp = zeros(mMax,1);
+                for m = 0:mMax-1
+                    CWm = min(params.fa.CWmax, params.fa.CWmin * 2^m);
+                    tmp(m+1) = piWindowStage(i, N, W, CWm);
+                end
+                piw_i(i) = sum(alpha .* tmp);
+            end
+
+            Bbar = 0;
+            for m = 0:mMax-1
+                CWm = min(params.fa.CWmax, params.fa.CWmin * 2^m);
+                Bbar = Bbar + alpha(m+1) * (CWm + 1)/2;
+            end
+
+            % Refresh ALP with final piw_i
+            for i = 1:max(N-W-1,0)
+                denom = 1 - fL * (1 - piw_i(i));
+                denom = max(denom, 1e-12);
+                ALP(i) = ((1 - H(i)) * g) / denom;
+                ALP(i) = min(max(ALP(i),0),1);
+            end
+
+            % Successes in LP slots
+            Sslots = zeros(N,1);
+            for i = 1:max(N-W-1,0)
+                Sslots(i) = ALP(i) * sL;
+            end
+            % HP slot success
+            Sslots(N) = Ph * sH;
+
+            Sframe = sum(Sslots);         % expected successes per frame
+            sendRate(idx) = Sframe / N;   % expected successes per slot
+
+            % ---------- Delay ----------
+            % Da: LP-success packets only
+            if sL > 0
+                if N-W-1 >= 1
+                    wgt = ALP(1:N-W-1);
+                    if sum(wgt) > 0
+                        piw_bar = sum(wgt .* piw_i(1:N-W-1)) / sum(wgt);
+                    else
+                        piw_bar = W / N;
+                    end
+                else
+                    piw_bar = 0;
+                end
+                Da = 2*d + (fL * (1 - piw_bar) / sL) * Bbar;
+            else
+                Da = inf;
+            end
+
+            % Db: HP-success packets
+            Dentry = 0;
+
+            % from outside window -> failed LP -> pushed into window
+            for i = 1:max(N-W-1,0)
+                Dentry = Dentry + ALP(i) * fL * piw_i(i) * (N - i);
+            end
+
+            % from inside window -> direct HP-bound packet
+            for i = max(N-W,1):N-1
+                Dentry = Dentry + (1 - H(i)) * g * (N - i);
+            end
+
+            if Ph > 0 && sH > 0
+                Db = Dentry / Ph + N * (fH / sH) + d;
+            else
+                Db = inf;
+            end
+
+            % Overall average delay
+            LPsuccesses = sum(Sslots(1:max(N-W-1,0)));
+            HPsuccesses = Sslots(N);
+
+            if Sframe > 0
+                delayAve(idx) = (Da * LPsuccesses + Db * HPsuccesses) / Sframe;
+            else
+                delayAve(idx) = inf;
+            end
+
+            % Best-W bookkeeping
+            if isfinite(delayAve(idx)) && delayAve(idx) < minDelay
+                minDelay = delayAve(idx);
+                maxSend  = sendRate(idx) * simTime * dataLength;
+            end
+
+            % Optional diagnostics
+            statsFAWADS(p).theory(idx).Pt     = Pt;
+            statsFAWADS(p).theory(idx).Ph     = Ph;
+            statsFAWADS(p).theory(idx).H      = H;
+            statsFAWADS(p).theory(idx).ALP    = ALP;
+            statsFAWADS(p).theory(idx).pL     = pL;
+            statsFAWADS(p).theory(idx).pH     = pH;
+            statsFAWADS(p).theory(idx).sL     = sL;
+            statsFAWADS(p).theory(idx).fL     = fL;
+            statsFAWADS(p).theory(idx).sH     = sH;
+            statsFAWADS(p).theory(idx).fH     = fH;
+            statsFAWADS(p).theory(idx).qc     = qc;
+            statsFAWADS(p).theory(idx).Da     = Da;
+            statsFAWADS(p).theory(idx).Db     = Db;
+            statsFAWADS(p).theory(idx).piw_i  = piw_i;
+            statsFAWADS(p).theory(idx).Bbar   = Bbar;
+            statsFAWADS(p).theory(idx).Sslots = Sslots;
+
+            
+            fprintf('W = %g\n', statsFAWADS(p).windowList(idx));
+            fprintf('sendRate = %.6f\n', statsFAWADS(p).sendRate(idx));
+            fprintf('delayAve = %.6f\n', statsFAWADS(p).delayAve(idx));
+            
+            fprintf('Pt = %.6f\n', statsFAWADS(p).theory(idx).Pt);
+            fprintf('Ph = %.6f\n', statsFAWADS(p).theory(idx).Ph);
+            fprintf('sL = %.6f\n', statsFAWADS(p).theory(idx).sL);
+            fprintf('sH = %.6f\n', statsFAWADS(p).theory(idx).sH);
+            fprintf('qc = %.6f\n', statsFAWADS(p).theory(idx).qc);
+            fprintf('Bbar = %.6f\n', statsFAWADS(p).theory(idx).Bbar);
+        end
+
+        statsFAWADS(p).windowList = windowSweep;
+        statsFAWADS(p).sendRate   = sendRate;
+        statsFAWADS(p).delayAve   = delayAve;
+        statsFAWADS(p).minDelay   = minDelay;
+        statsFAWADS(p).maxSend    = maxSend;
+    end
+end
+
+% -------------------------------------------------------------------------
+function val = piWindowStage(i, N, W, CWm)
+% Probability that, after failure in slot i and stage-m backoff uniformly
+% drawn from {1,...,CWm}, the tentative retry lands in the window.
+%
+% Theory frame is indexed so the tagged node's assigned slot is N.
+
+    if CWm <= 0
+        val = 0;
+        return;
+    end
+
+    cnt = 0;
+    for b = 1:CWm
+        tprime = i + b;
+        phase  = mod(tprime, N);     % values in 0,...,N-1
+        r      = mod(N - phase, N);  % distance to assigned slot N
+        if r <= W
+            cnt = cnt + 1;
+        end
+    end
+    val = cnt / CWm;
+end
+
+% -------------------------------------------------------------------------
+function alpha = stageWeightsGeometric(fStayLP, mMax)
+% Truncated geometric weights over retry stages m=0,...,mMax-1
+
+    fStayLP = min(max(fStayLP, 0), 0.999999);
+
+    alpha = zeros(mMax,1);
+    for m = 0:mMax-1
+        alpha(m+1) = fStayLP^m;
+    end
+
+    s = sum(alpha);
+    if s > 0
+        alpha = alpha / s;
+    else
+        alpha(1) = 1;
+    end
+end
+
+% -------------------------------------------------------------------------
+function c = nchoosek_safe(n, k)
+% Safer combinatorial helper for small/moderate n
+    if k < 0 || k > n
+        c = 0;
+    elseif k == 0 || k == n
+        c = 1;
+    else
+        c = nchoosek(n, k);
+    end
+end
